@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.config import ROOT, load_airports, load_flights
+from app.config import ROOT, airports_digest, load_airports, load_flights
 from app.repository import Repository
 from app.service import DisruptionService
 
@@ -19,8 +19,16 @@ class ServiceTestCase(unittest.TestCase):
         self.db_path = Path(self._tmp.name) / "test.db"
         self.airports = load_airports(FIXTURES_DIR)
         self.flights = load_flights(FIXTURES_DIR, self.airports)
+        self.config_digest = airports_digest(self.airports)
         self.repo = Repository(self.db_path)
-        self.service = DisruptionService(self.repo, self.airports, self.flights)
+        # 与真实启动路径相同：先登记机场事实，再装配服务。
+        self.repo.register_airport_facts(self.airports, self.config_digest)
+        self.service = DisruptionService(
+            self.repo,
+            self.airports,
+            self.flights,
+            config_digest=self.config_digest,
+        )
 
     def tearDown(self) -> None:
         self.repo.close()
@@ -30,7 +38,14 @@ class ServiceTestCase(unittest.TestCase):
         """模拟容器重启后重新打开同一数据库文件。"""
         self.repo.close()
         self.repo = Repository(self.db_path)
-        self.service = DisruptionService(self.repo, self.airports, self.flights)
+        # 重启必须重新通过启动门禁；相同配置核对通过、读取相同摘要。
+        self.repo.register_airport_facts(self.airports, self.config_digest)
+        self.service = DisruptionService(
+            self.repo,
+            self.airports,
+            self.flights,
+            config_digest=self.config_digest,
+        )
         return self.service
 
 

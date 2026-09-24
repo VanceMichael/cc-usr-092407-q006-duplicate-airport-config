@@ -26,13 +26,37 @@ class DisruptionService:
         repo: Repository,
         airports: dict[str, Airport],
         flights: dict[str, Flight],
+        *,
+        config_digest: str | None = None,
     ):
         self._repo = repo
         self._airports = airports
         self._flights = flights
+        self._config_digest = config_digest
 
     def healthy(self) -> bool:
+        """存活性：进程与数据库连接可用。"""
         return self._repo.ping()
+
+    def ready(self) -> tuple[bool, dict[str, Any]]:
+        """就绪性：可以接管流量。
+
+        除了数据库可用，还要求库中登记的机场事实摘要与当前装载的配置
+        一致——配置与历史事实冲突的实例不得接收请求。
+        """
+        if not self._repo.ping():
+            return False, {"detail": "storage unavailable"}
+        registered = self._repo.registered_digest()
+        if registered is None:
+            return False, {"detail": "airport facts not registered"}
+        if self._config_digest is not None and registered != self._config_digest:
+            return False, {
+                "detail": "registered airport facts differ from the loaded configuration"
+            }
+        return True, {
+            "config_digest": registered,
+            "airports": len(self._airports),
+        }
 
     # ------------------------------------------------------------------ #
     # Event intake
@@ -44,7 +68,8 @@ class DisruptionService:
 
         with self._repo.transaction() as conn:
             existing = conn.execute(
-                "SELECT event_version, payload_json FROM events WHERE event_id = ?",
+                "SELECT event_version, payload_json, config_digest "
+                "FROM events WHERE event_id = ?",
                 (event.event_id,),
             ).fetchone()
 
@@ -60,7 +85,7 @@ class DisruptionService:
                 self._flights,
             )
             impacts.extend(self._resolved_tombstones(conn, event, root, impacts))
-            self._repo.insert_event(conn, event.to_dict())
+            self._repo.insert_event(conn, event.to_dict(), self._config_digest)
             if impacts:
                 self._repo.insert_impacts(conn, impacts)
             return self._result(event, impacts, replayed=False)
@@ -108,7 +133,12 @@ class DisruptionService:
             # Idempotent retry: return the original result, bump the counter.
             self._repo.increment_replay(conn, event.event_id)
             impacts = self._repo.get_impacts(event.event_id)
-            return self._result(event, [dict(r) for r in impacts], replayed=True)
+            return self._result(
+                event,
+                [dict(r) for r in impacts],
+                replayed=True,
+                config_digest=existing["config_digest"],
+            )
 
         # Same identity, different content.
         if event.event_version == stored_version:
@@ -289,6 +319,7 @@ class DisruptionService:
                 "state": "processed",
                 "replay_count": row["replay_count"],
                 "created_at": row["created_at"],
+                "config_digest": row["config_digest"],
                 "impact_count": len(active),
                 "resolved_count": len(impacts) - len(active),
                 "affected_passengers": passengers,
@@ -364,7 +395,12 @@ class DisruptionService:
     # ------------------------------------------------------------------ #
 
     def _result(
-        self, event: DisruptionEvent, impacts: list[dict[str, Any]], *, replayed: bool
+        self,
+        event: DisruptionEvent,
+        impacts: list[dict[str, Any]],
+        *,
+        replayed: bool,
+        config_digest: str | None = None,
     ) -> dict[str, Any]:
         active_impacts = [i for i in impacts if i["impact_status"] != "resolved"]
         serialized = [self._impact_dict(i) for i in active_impacts]
@@ -377,6 +413,7 @@ class DisruptionService:
             "event_id": event.event_id,
             "event_version": event.event_version,
             "processing_state": "replayed" if replayed else "processed",
+            "config_digest": config_digest if config_digest is not None else self._config_digest,
             "impact_count": len(serialized),
             "resolved_count": len(impacts) - len(active_impacts),
             "affected_passengers": passengers,

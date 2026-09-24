@@ -378,6 +378,26 @@ def seed() -> int:
     status, health = request("GET", "/healthz")
     check(status == 200 and health["status"] == "ok", "health endpoint reports ok")
 
+    print("== seed: readiness exposes the airport config digest ==")
+    status, ready = request("GET", "/readyz")
+    check(status == 200 and ready["status"] == "ready", "readiness endpoint reports ready")
+    digest = ready.get("config_digest")
+    check(
+        isinstance(digest, str) and len(digest) == 64,
+        "readiness exposes the registered airport config digest",
+    )
+    check(
+        aps_result.get("config_digest") == digest
+        and bsr_result.get("config_digest") == digest
+        and kta_result.get("config_digest") == digest,
+        "event results carry the same config digest as readiness",
+    )
+    status, aps_status = request("GET", f"/api/v1/events/{APS_CLOSE}")
+    check(
+        aps_status["processing"].get("config_digest") == digest,
+        "stored event keeps the config digest it was computed with",
+    )
+
     return finish("seed")
 
 
@@ -390,12 +410,28 @@ def verify() -> int:
     status, health = request("GET", "/healthz")
     check(status == 200 and health["status"] == "ok", "health endpoint ok after restart")
 
+    print("== verify: readiness and airport definition survived the restart ==")
+    status, ready = request("GET", "/readyz")
+    check(
+        status == 200 and ready["status"] == "ready",
+        "readiness endpoint ready after restart",
+    )
+    digest = ready.get("config_digest")
+    check(
+        isinstance(digest, str) and len(digest) == 64,
+        "config digest still registered after restart",
+    )
+
     print("== verify: events and impacts survived the restart ==")
     status, aps1 = request("GET", f"/api/v1/events/{APS_CLOSE}")
     check(status == 200 and len(aps1["impacts"]) == 3,
           "original APS closure with 3 impacts survived")
     check(aps1["processing"]["replay_count"] == 1,
           f"replay_count=1 survived (got {aps1['processing']['replay_count']})")
+    check(
+        aps1["processing"].get("config_digest") == digest,
+        "stored event digest still matches the registered airport definition",
+    )
 
     status, aps2 = request("GET", f"/api/v1/events/{APS_CLOSE_2}")
     check(status == 200 and len(aps2["impacts"]) == 3,
@@ -443,6 +479,10 @@ def verify() -> int:
           "duplicate submission after restart replays")
     check(replay_after["impacts"] == aps2["impacts"],
           "post-restart replay returns identical original result")
+    check(
+        replay_after.get("config_digest") == digest,
+        "post-restart replay returns the original config digest",
+    )
     status, aps2_again = request("GET", f"/api/v1/events/{APS_CLOSE_2}")
     check(aps2_again["processing"]["replay_count"] == count_before + 1,
           f"replay_count advanced by one after restart "

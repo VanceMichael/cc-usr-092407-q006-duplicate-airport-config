@@ -39,6 +39,23 @@ class UnknownAirportError(ValidationError):
     code = "unknown_airport"
 
 
+class ConfigError(AppError):
+    """配置装载或启动门禁错误。
+
+    只在启动阶段抛出，不会进入 HTTP 响应；消息与 details 必须带来源
+    位置（如 ``airports[2]``），且与记录在文件中的顺序无关。
+    """
+
+    code = "config_error"
+    status = 500
+
+
+class ConfigConflictError(ConfigError):
+    """新配置与数据库中已登记的机场事实冲突。"""
+
+    code = "config_conflict"
+
+
 class EventConflictError(AppError):
     code = "event_conflict"
     status = 409

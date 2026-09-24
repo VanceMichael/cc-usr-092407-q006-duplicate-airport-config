@@ -47,6 +47,30 @@ class HttpTest(ServiceTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "ok")
 
+    def test_readiness_is_distinct_from_health(self) -> None:
+        # /healthz 只报告存活性；/readyz 额外报告已登记的机场事实摘要，
+        # 只有摘要与装载配置一致的实例才返回 ready。
+        status, health = _request("GET", f"{self.base}/healthz")
+        self.assertEqual(status, 200)
+        self.assertNotIn("config_digest", health)
+
+        status, ready = _request("GET", f"{self.base}/readyz")
+        self.assertEqual(status, 200)
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(ready["config_digest"], self.config_digest)
+        self.assertEqual(ready["airports"], 3)
+
+    def test_event_result_digest_matches_readiness_digest(self) -> None:
+        _, ready = _request("GET", f"{self.base}/readyz")
+        status, body = _request("POST", f"{self.base}/api/v1/events", base_event())
+        self.assertEqual(status, 201)
+        self.assertEqual(body["config_digest"], ready["config_digest"])
+
+        _, fetched = _request("GET", f"{self.base}/api/v1/events/{body['event_id']}")
+        self.assertEqual(
+            fetched["processing"]["config_digest"], ready["config_digest"]
+        )
+
     def test_valid_event_round_trip(self) -> None:
         status, body = _request("POST", f"{self.base}/api/v1/events", base_event())
         self.assertEqual(status, 201)

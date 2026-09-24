@@ -72,6 +72,15 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                     self._send_json(200, {"status": "ok"})
                     return
 
+                if path == "/readyz":
+                    self._require_method(method, "GET", path)
+                    ready, detail = state.service.ready()
+                    if not ready:
+                        self._send_json(503, {"status": "not_ready", **detail})
+                        return
+                    self._send_json(200, {"status": "ready", **detail})
+                    return
+
                 if path == "/api/v1" or path == "/":
                     self._require_method(method, "GET", path)
                     self._send_json(
@@ -84,6 +93,7 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                                 "GET  /api/v1/airports/{airport_code}/summary",
                                 "GET  /api/v1/flights/affected",
                                 "GET  /healthz",
+                                "GET  /readyz",
                             ],
                         },
                     )
