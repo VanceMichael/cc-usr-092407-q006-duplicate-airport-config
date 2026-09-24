@@ -30,6 +30,27 @@ class AppError(Exception):
         return {"error": body}
 
 
+class ConfigError(AppError):
+    """配置/夹具本身非法：进程不得进入就绪状态。
+
+    每条问题都携带来源位置（文件路径与数组下标），details["issues"]
+    按 (location, field, issue) 确定性排序，与文件行序无关。
+    """
+
+    code = "config_invalid"
+    status = 500  # not an HTTP-input error; mapped at the startup gate
+
+
+class ConfigConflictError(AppError):
+    """已登记的机场事实与当前配置冲突。
+
+    新实例必须保持旧数据可读但拒绝接管流量；绝不覆盖或部分重写数据库。
+    """
+
+    code = "config_conflict"
+    status = 503
+
+
 class ValidationError(AppError):
     code = "validation_error"
     status = 422

@@ -26,6 +26,16 @@ if ! grep -q '"timezone"' fixtures/airports.json; then
   exit 1
 fi
 
+# Coarse pre-build duplicate-code guard. The application loader performs the
+# authoritative, source-located validation; this catches an obvious merge
+# accident (same three-letter code on two rows) before deployment.
+dups="$(grep -oE '"code"[[:space:]]*:[[:space:]]*"[A-Z]{3}"' fixtures/airports.json \
+  | grep -oE '[A-Z]{3}' | sort | uniq -d || true)"
+if [ -n "$dups" ]; then
+  echo "Airport fixture contains duplicate airport code(s): $dups" >&2
+  exit 1
+fi
+
 for field in flight_id origin destination scheduled_departure scheduled_arrival; do
   if ! grep -q "\"$field\"" fixtures/flights.json; then
     echo "Flight fixture is missing field: $field" >&2

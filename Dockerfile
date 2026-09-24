@@ -11,6 +11,7 @@ COPY app/ ./app/
 COPY fixtures/ ./fixtures/
 COPY tests/ ./tests/
 COPY scripts/selftest_client.py ./scripts/selftest_client.py
+COPY scripts/gate_conflict_check.py ./scripts/gate_conflict_check.py
 
 RUN addgroup -S app && adduser -S -G app -h /srv app \
     && mkdir -p /data \
@@ -29,6 +30,6 @@ VOLUME ["/data"]
 EXPOSE 8080
 
 HEALTHCHECK --interval=3s --timeout=3s --start-period=2s --retries=10 \
-    CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
+    CMD wget -q -O /dev/null http://127.0.0.1:8080/readyz || exit 1
 
 CMD ["python", "-m", "app"]

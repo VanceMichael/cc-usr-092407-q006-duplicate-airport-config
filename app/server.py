@@ -11,10 +11,12 @@ from urllib.parse import parse_qs, urlsplit
 from app.errors import (
     AppError,
     BadRequestError,
+    ConfigConflictError,
     MethodNotAllowedError,
     NotFoundError,
     UnsupportedMediaTypeError,
 )
+from app.repository import GateStatus
 from app.service import DisruptionService
 
 MAX_BODY_BYTES = 64 * 1024
@@ -23,8 +25,34 @@ MAX_LIMIT = 200
 
 
 class AppState:
-    def __init__(self, service: DisruptionService):
+    """进程级运行状态。
+
+    ``service`` 为 None 表示启动门禁未通过（配置与已登记机场事实冲突）。
+    此时进程仍然存活、数据库仍可打开（健康检查为 ok），但既不报告就绪也
+    不处理任何业务请求——新实例不得接管流量，旧实例在同一卷上继续可读。
+    """
+
+    def __init__(
+        self,
+        service: DisruptionService | None = None,
+        *,
+        gate_status: GateStatus | None = None,
+        gate_error: ConfigConflictError | None = None,
+    ):
         self.service = service
+        self.gate_status = gate_status
+        self.gate_error = gate_error
+
+    @property
+    def ready(self) -> bool:
+        return self.service is not None and self.gate_error is None
+
+    def storage_ok(self) -> bool:
+        if self.service is None:
+            # Gate failure leaves the database intact and openable; liveness
+            # only fails when the process itself is gone.
+            return True
+        return self.service.healthy()
 
 
 def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
@@ -61,15 +89,70 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 path = parts.path.rstrip("/") or "/"
                 query = parse_qs(parts.query)
 
+                # Liveness: the process is up. Independent of the startup gate
+                # so an orchestrator does not kill an instance that is
+                # deliberately holding an old, readable database.
                 if path == "/healthz":
                     self._require_method(method, "GET", path)
-                    if not state.service.healthy():
+                    if not state.storage_ok():
                         self._send_json(
                             503,
                             {"status": "degraded", "detail": "storage unavailable"},
                         )
                         return
                     self._send_json(200, {"status": "ok"})
+                    return
+
+                # Readiness: the configuration gate passed and this instance is
+                # allowed to serve traffic. Distinct from /healthz by contract.
+                if path == "/readyz":
+                    self._require_method(method, "GET", path)
+                    if state.gate_error is not None:
+                        self._send_json(
+                            503,
+                            {
+                                "status": "not_ready",
+                                "reason": "config_conflict",
+                                "error": state.gate_error.to_dict()["error"],
+                            },
+                        )
+                        return
+                    if state.service is None or not state.storage_ok():
+                        self._send_json(
+                            503,
+                            {"status": "not_ready", "reason": "starting"},
+                        )
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "status": "ready",
+                            "gate": state.gate_status.to_dict()
+                            if state.gate_status
+                            else None,
+                        },
+                    )
+                    return
+
+                # Business traffic is refused until the gate has passed.
+                if path.startswith("/api/") and not state.ready:
+                    self._send_json(
+                        503,
+                        {
+                            "error": {
+                                "code": "service_not_ready",
+                                "message": (
+                                    "Service is not ready: airport configuration "
+                                    "conflicts with the registered database facts"
+                                ),
+                                "details": (
+                                    state.gate_error.details
+                                    if state.gate_error is not None
+                                    else {}
+                                ),
+                            }
+                        },
+                    )
                     return
 
                 if path == "/api/v1" or path == "/":
@@ -84,6 +167,7 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                                 "GET  /api/v1/airports/{airport_code}/summary",
                                 "GET  /api/v1/flights/affected",
                                 "GET  /healthz",
+                                "GET  /readyz",
                             ],
                         },
                     )
@@ -221,7 +305,13 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def build_server(host: str, port: int, service: DisruptionService) -> ThreadingHTTPServer:
-    state = AppState(service)
+def build_server(
+    host: str, port: int, service_or_state: DisruptionService | AppState
+) -> ThreadingHTTPServer:
+    state = (
+        service_or_state
+        if isinstance(service_or_state, AppState)
+        else AppState(service_or_state)
+    )
     server = ThreadingHTTPServer((host, port), make_handler(state))
     return server

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import unittest
+
 from app.errors import EventConflictError, NotFoundError, ValidationError
 from tests.support import ServiceTestCase, base_event
 

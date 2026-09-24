@@ -9,7 +9,8 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-from app.server import build_server
+from app.server import build_server, AppState
+from app.errors import ConfigConflictError
 from tests.support import ServiceTestCase, base_event
 
 
@@ -24,13 +25,15 @@ def _request(method: str, url: str, body=None):
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
+        with exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
 class HttpTest(ServiceTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.server: ThreadingHTTPServer = build_server("127.0.0.1", 0, self.service)
+        state = AppState(service=self.service, gate_status=self.gate_status)
+        self.server: ThreadingHTTPServer = build_server("127.0.0.1", 0, state)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -165,6 +168,90 @@ class HttpTest(ServiceTestCase):
         self.assertEqual(status, 201)
         self.assertTrue(all(i["crosses_midnight"] for i in body["impacts"]))
         self.assertEqual(body["impact_count"], 3)
+
+    def test_healthz_and_readyz_distinct(self) -> None:
+        status, health = _request("GET", f"{self.base}/healthz")
+        self.assertEqual((status, health["status"]), (200, "ok"))
+        status, ready = _request("GET", f"{self.base}/readyz")
+        self.assertEqual(status, 200)
+        self.assertEqual(ready["status"], "ready")
+        self.assertIn("config_digest", ready["gate"])
+        self.assertEqual(ready["gate"]["state"], "empty_initialized")
+
+    def test_event_result_and_status_carry_config_summary(self) -> None:
+        status, body = _request("POST", f"{self.base}/api/v1/events", base_event())
+        self.assertEqual(status, 201)
+        digest = body["config"]["config_digest"]
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(body["config"]["airport"]["code"], "APS")
+        self.assertEqual(
+            body["config"]["airport"]["reopen_buffer_minutes"], 20
+        )
+        status, fetched = _request(
+            "GET", f"{self.base}/api/v1/events/{body['event_id']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["config"]["config_digest"], digest)
+        self.assertEqual(fetched["config"]["airport"]["timezone"], "Asia/Makassar")
+
+
+class GateFailedHttpTest(unittest.TestCase):
+    """门禁冲突时：进程存活、就绪失败、所有业务请求 503。"""
+
+    def setUp(self) -> None:
+        conflict = ConfigConflictError(
+            "Airport configuration conflicts with registered facts",
+            {
+                "config_digest": "deadbeef",
+                "issues": [
+                    {
+                        "field": "reopen_buffer_minutes",
+                        "issue": "airport_definition_changed",
+                        "code": "APS",
+                        "registered": 20,
+                        "configured": 99,
+                        "configured_location": "fixtures/airports.json[0]",
+                    }
+                ],
+            },
+        )
+        state = AppState(service=None, gate_status=None, gate_error=conflict)
+        self.server: ThreadingHTTPServer = build_server("127.0.0.1", 0, state)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def test_liveness_ok_but_not_ready(self) -> None:
+        status, health = _request("GET", f"{self.base}/healthz")
+        self.assertEqual((status, health["status"]), (200, "ok"))
+        status, ready = _request("GET", f"{self.base}/readyz")
+        self.assertEqual(status, 503)
+        self.assertEqual(ready["status"], "not_ready")
+        self.assertEqual(ready["reason"], "config_conflict")
+        self.assertEqual(
+            ready["error"]["details"]["issues"][0]["configured"], 99
+        )
+
+    def test_business_traffic_refused_with_location(self) -> None:
+        status, body = _request("GET", f"{self.base}/api/v1/events/evt-x")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["code"], "service_not_ready")
+        self.assertEqual(
+            body["error"]["details"]["issues"][0]["configured_location"],
+            "fixtures/airports.json[0]",
+        )
+        status, _ = _request("GET", f"{self.base}/api/v1/flights/affected")
+        self.assertEqual(status, 503)
+        status, _ = _request(
+            "POST", f"{self.base}/api/v1/events", base_event()
+        )
+        self.assertEqual(status, 503)
 
 
 if __name__ == "__main__":

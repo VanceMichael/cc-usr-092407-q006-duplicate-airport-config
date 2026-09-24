@@ -7,12 +7,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.errors import EventConflictError, NotFoundError, ValidationError
+from app.config import AirportConfig
 from app.engine import compute_impacts
 from app.models import (
     EVENT_CLOSED,
     EVENT_EXTENDED,
     EVENT_REOPENED,
-    Airport,
     DisruptionEvent,
     Flight,
 )
@@ -24,12 +24,17 @@ class DisruptionService:
     def __init__(
         self,
         repo: Repository,
-        airports: dict[str, Airport],
+        airport_config: AirportConfig,
         flights: dict[str, Flight],
     ):
         self._repo = repo
-        self._airports = airports
+        self._config = airport_config
+        self._airports = airport_config
         self._flights = flights
+
+    @property
+    def config_digest(self) -> str:
+        return self._config.digest
 
     def healthy(self) -> bool:
         return self._repo.ping()
@@ -44,13 +49,13 @@ class DisruptionService:
 
         with self._repo.transaction() as conn:
             existing = conn.execute(
-                "SELECT event_version, payload_json FROM events WHERE event_id = ?",
+                "SELECT event_version, payload_json, config_digest "
+                "FROM events WHERE event_id = ?",
                 (event.event_id,),
             ).fetchone()
 
             if existing is not None:
                 return self._handle_duplicate(conn, event, existing)
-
             self._validate_chain(conn, event)
             root = self._resolve_root(conn, event)
             impacts = compute_impacts(
@@ -60,10 +65,12 @@ class DisruptionService:
                 self._flights,
             )
             impacts.extend(self._resolved_tombstones(conn, event, root, impacts))
-            self._repo.insert_event(conn, event.to_dict())
+            self._repo.insert_event(conn, event.to_dict(), self._config.digest)
             if impacts:
                 self._repo.insert_impacts(conn, impacts)
-            return self._result(event, impacts, replayed=False)
+            return self._result(
+                event, impacts, replayed=False, config_digest=self._config.digest
+            )
 
     def _resolved_tombstones(
         self, conn, event: DisruptionEvent, root: DisruptionEvent, impacts: list[dict]
@@ -102,13 +109,17 @@ class DisruptionService:
     ) -> dict[str, Any]:
         stored_version = existing["event_version"]
         stored_payload = json.loads(existing["payload_json"])
+        stored_digest = existing["config_digest"] or self._config.digest
 
         same_body = stored_payload == event.to_dict()
         if same_body:
             # Idempotent retry: return the original result, bump the counter.
             self._repo.increment_replay(conn, event.event_id)
             impacts = self._repo.get_impacts(event.event_id)
-            return self._result(event, [dict(r) for r in impacts], replayed=True)
+            return self._result(
+                event, [dict(r) for r in impacts],
+                replayed=True, config_digest=stored_digest,
+            )
 
         # Same identity, different content.
         if event.event_version == stored_version:
@@ -294,8 +305,35 @@ class DisruptionService:
                 "affected_passengers": passengers,
                 "status_breakdown": statuses,
             },
+            "config": self._stored_config_block(
+                row["airport_code"], row["config_digest"]
+            ),
             "impacts": active,
         }
+
+    def _stored_config_block(
+        self, airport_code: str, digest: str | None
+    ) -> dict[str, Any]:
+        """返回事件登记时所用配置摘要；优先取该修订中持久化的机场定义。"""
+        airport = None
+        if digest:
+            revision = self._repo.get_config_revision(digest)
+            if revision is not None:
+                for fact in json.loads(revision["manifest_json"]):
+                    if fact["code"] == airport_code:
+                        airport = fact
+                        break
+        if airport is None:
+            # Legacy v1 rows carry no digest; the startup gate guarantees the
+            # current definition matches every referenced airport.
+            current = self._config[airport_code]
+            airport = {
+                "code": current.code,
+                "name": current.name,
+                "timezone": current.timezone,
+                "reopen_buffer_minutes": current.reopen_buffer_minutes,
+            }
+        return {"config_digest": digest, "airport": airport}
 
     def airport_summary(self, airport_code: str) -> dict[str, Any]:
         if airport_code not in self._airports:
@@ -320,6 +358,7 @@ class DisruptionService:
         return {
             "airport_code": airport_code,
             "airport_name": self._airports[airport_code].name,
+            "config_digest": self._config.digest,
             "event_count": len(rows),
             "active_chains": len(chain_roots)
             - sum(1 for r in rows if r["event_type"] == EVENT_REOPENED),
@@ -364,7 +403,12 @@ class DisruptionService:
     # ------------------------------------------------------------------ #
 
     def _result(
-        self, event: DisruptionEvent, impacts: list[dict[str, Any]], *, replayed: bool
+        self,
+        event: DisruptionEvent,
+        impacts: list[dict[str, Any]],
+        *,
+        replayed: bool,
+        config_digest: str,
     ) -> dict[str, Any]:
         active_impacts = [i for i in impacts if i["impact_status"] != "resolved"]
         serialized = [self._impact_dict(i) for i in active_impacts]
@@ -377,11 +421,24 @@ class DisruptionService:
             "event_id": event.event_id,
             "event_version": event.event_version,
             "processing_state": "replayed" if replayed else "processed",
+            "config": self._config_block_for(event.airport_code, config_digest),
             "impact_count": len(serialized),
             "resolved_count": len(impacts) - len(active_impacts),
             "affected_passengers": passengers,
             "status_breakdown": statuses,
             "impacts": serialized,
+        }
+
+    def _config_block_for(self, airport_code: str, digest: str) -> dict[str, Any]:
+        airport = self._config[airport_code]
+        return {
+            "config_digest": digest,
+            "airport": {
+                "code": airport.code,
+                "name": airport.name,
+                "timezone": airport.timezone,
+                "reopen_buffer_minutes": airport.reopen_buffer_minutes,
+            },
         }
 
     @staticmethod

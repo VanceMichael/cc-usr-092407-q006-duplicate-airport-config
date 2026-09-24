@@ -51,6 +51,11 @@ log "Running automated unit tests inside the image"
 log "Seed phase: valid/invalid events, idempotency, cross-midnight"
 "${COMPOSE[@]}" exec -T api python scripts/selftest_client.py seed http://127.0.0.1:8080
 
+# 4b. Startup gate: shuffled config aligns; divergent config is blocked, keeps
+#     the old instance readable, and never overwrites registered facts.
+log "Gate ordering/conflict check (second instance against the same SQLite file)"
+"${COMPOSE[@]}" exec -T api python scripts/gate_conflict_check.py http://127.0.0.1:8080
+
 # Sanity: the SQLite file really lives on the mounted volume.
 log "Checking database file exists on the persistent volume"
 "${COMPOSE[@]}" exec -T api sh -c 'test -s /data/disruptions.db && echo "db file present"'
@@ -59,7 +64,7 @@ log "Checking database file exists on the persistent volume"
 log "Restarting api container (volume stays attached)"
 "${COMPOSE[@]}" restart api
 
-log "Waiting for the restarted service to become healthy"
+log "Waiting for the restarted service to become ready (image healthcheck uses /readyz)"
 deadline=$(( $(date +%s) + 60 ))
 container_id="$("${COMPOSE[@]}" ps -q api)"
 while :; do

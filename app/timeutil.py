@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from pathlib import Path
+from zoneinfo import TZPATH, ZoneInfo, ZoneInfoNotFoundError
 
 from app.errors import ValidationError
 
@@ -59,6 +60,37 @@ def load_timezone(name: str) -> ZoneInfo:
             f"Airport timezone '{name}' is not a valid IANA timezone",
             {"timezone": name},
         ) from None
+
+
+def canonical_timezone_name(name: str) -> str:
+    """把 IANA 链接别名（如 ``Zulu``、``Singapore``）解析为目标时区名。
+
+    tzdata 用符号链接表达"别名指向同一时区规则"（``Singapore`` ->
+    ``Asia/Singapore``、``Zulu`` -> ``Etc/UTC``）。配置合并时两条记录可能用
+    不同字符串写出语义相同的时区；这里统一按 ZoneInfo 的搜索路径
+    (``TZPATH``) 逐级跟随链接，使跨环境的规范化结果一致。
+
+    当时区数据库不通过符号链接暴露链接关系（例如仅安装了 ``tzdata`` PyPI
+    包）时，原样返回名称——调用方已用 :func:`load_timezone` 确认其可加载。
+    """
+    for base in TZPATH:
+        root = Path(base)
+        candidate = root / name
+        try:
+            if not (candidate.exists() or candidate.is_symlink()):
+                continue
+            resolved = candidate.resolve(strict=True)
+            root_real = root.resolve()
+            target = resolved.relative_to(root_real)
+        except (OSError, ValueError):
+            continue
+        canonical = target.as_posix()
+        try:
+            ZoneInfo(canonical)
+        except (ZoneInfoNotFoundError, ValueError):
+            return name
+        return canonical
+    return name
 
 
 def overlaps(start_a: datetime, end_a: datetime, start_b: datetime, end_b: datetime) -> bool:

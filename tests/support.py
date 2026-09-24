@@ -13,6 +13,12 @@ from app.service import DisruptionService
 FIXTURES_DIR = ROOT / "fixtures"
 
 
+def gate_repo(repo: Repository, airport_config):
+    """让数据库走与真实启动相同的配置门禁（建表/迁移/登记在单事务内）。"""
+    locations = {e.airport.code: e.location for e in airport_config.entries()}
+    return repo.gate(airport_config.digest, airport_config.manifest(), locations)
+
+
 class ServiceTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -20,6 +26,7 @@ class ServiceTestCase(unittest.TestCase):
         self.airports = load_airports(FIXTURES_DIR)
         self.flights = load_flights(FIXTURES_DIR, self.airports)
         self.repo = Repository(self.db_path)
+        self.gate_status = gate_repo(self.repo, self.airports)
         self.service = DisruptionService(self.repo, self.airports, self.flights)
 
     def tearDown(self) -> None:
@@ -27,9 +34,10 @@ class ServiceTestCase(unittest.TestCase):
         self._tmp.cleanup()
 
     def restart_service(self) -> DisruptionService:
-        """模拟容器重启后重新打开同一数据库文件。"""
+        """模拟容器重启后重新打开同一数据库文件（重新过门禁）。"""
         self.repo.close()
         self.repo = Repository(self.db_path)
+        self.gate_status = gate_repo(self.repo, self.airports)
         self.service = DisruptionService(self.repo, self.airports, self.flights)
         return self.service
 

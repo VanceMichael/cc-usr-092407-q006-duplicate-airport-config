@@ -26,6 +26,10 @@ KTA_CLOSE = "volc-kta-close001"
 APS_REOPEN = "volc-aps-reopen01"
 APS_CLOSE_2 = "volc-aps-close002"
 
+# Filled during seed from /readyz; every event result must carry this same
+# digest, proving one airport definition set backs the whole process.
+CONFIG_DIGEST: str | None = None
+
 FAILURES: list[str] = []
 
 
@@ -34,6 +38,16 @@ def check(condition: bool, message: str) -> None:
     print(f"  [{marker}] {message}")
     if not condition:
         FAILURES.append(message)
+
+
+def check_digest(value: str, context: str) -> bool:
+    ok = isinstance(value, str) and len(value) == 64 and all(
+        c in "0123456789abcdef" for c in value
+    )
+    check(ok, f"{context} carries a 64-char sha256 config digest")
+    if ok and CONFIG_DIGEST is not None:
+        check(value == CONFIG_DIGEST, f"{context} uses the registered config digest")
+    return ok
 
 
 def request(method: str, path: str, body: Any = None, *, raw: bytes | None = None,
@@ -67,7 +81,41 @@ def impacts_by_flight(result: dict) -> dict[str, dict]:
 # Seed phase
 # --------------------------------------------------------------------------- #
 
+def startup_probe() -> None:
+    print("== startup: liveness and readiness are distinct ==")
+    status, health = request("GET", "/healthz")
+    check(status == 200 and health.get("status") == "ok",
+          f"/healthz reports liveness ok (got {status} {health})")
+    status, ready = request("GET", "/readyz")
+    check(status == 200 and ready.get("status") == "ready",
+          f"/readyz reports readiness (got {status} {ready})")
+    gate = ready.get("gate", {}) if status == 200 else {}
+    digest = gate.get("config_digest")
+    check(isinstance(digest, str) and len(digest) == 64,
+          "/readyz exposes the 64-char config digest")
+    check(gate.get("registered_airports") == ["APS", "BSR", "KTA"],
+          f"gate registered the canonical, code-sorted airport set "
+          f"(got {gate.get('registered_airports')})")
+    globals()["CONFIG_DIGEST"] = digest
+
+
+def assert_config_block(result: dict, label: str, code: str, buffer_min: int) -> None:
+    cfg = result.get("config", {})
+    check_digest(cfg.get("config_digest"), f"{label} result")
+    airport = cfg.get("airport", {})
+    check(
+        airport.get("code") == code
+        and airport.get("reopen_buffer_minutes") == buffer_min
+        and isinstance(airport.get("timezone"), str)
+        and isinstance(airport.get("name"), str),
+        f"{label} result embeds the {code} definition used for the calculation "
+        f"(got {airport})",
+    )
+
+
 def seed() -> int:
+    startup_probe()
+
     print("== seed: malformed / non-JSON requests ==")
     status, body = request(
         "POST", "/api/v1/events", raw=b"{not valid json",
@@ -165,6 +213,7 @@ def seed() -> int:
     }
     status, aps_result = post_event(aps_close)
     check(status == 201, f"APS closure accepted (got {status})")
+    assert_config_block(aps_result, "APS closure", "APS", 20)
     check(aps_result["processing_state"] == "processed", "APS result state=processed")
     check(aps_result["impact_count"] == 3, "APS closure impacts 3 flights "
           f"(got {aps_result['impact_count']})")
@@ -200,6 +249,7 @@ def seed() -> int:
     }
     status, bsr_result = post_event(bsr_close)
     check(status == 201, f"BSR open-ended closure accepted (got {status})")
+    assert_config_block(bsr_result, "BSR closure", "BSR", 15)
     bsr_impacts = impacts_by_flight(bsr_result)
     check(
         bsr_impacts.get("BY-205-20260908", {}).get("impact_status") == "pending_confirmation",
@@ -227,6 +277,7 @@ def seed() -> int:
     }
     status, kta_result = post_event(kta_close)
     check(status == 201, f"KTA closure accepted (got {status})")
+    assert_config_block(kta_result, "KTA closure", "KTA", 10)
     kx = impacts_by_flight(kta_result).get("KX-099-20260908")
     check(kx is not None and kx["impact_status"] == "delayed", "KX099 delayed at KTA")
     check(kx is not None and kx["delay_minutes"] == 20, "KX099 delay is 20 minutes")
@@ -295,6 +346,7 @@ def seed() -> int:
     }
     status, reopen_result = post_event(reopen)
     check(status == 201, f"APS reopen accepted (got {status})")
+    assert_config_block(reopen_result, "APS reopen", "APS", 20)
     check(reopen_result["impact_count"] == 0,
           f"reopen frees all APS flights (active impacts {reopen_result['impact_count']})")
     check(reopen_result["resolved_count"] == 3,
@@ -315,6 +367,7 @@ def seed() -> int:
     }
     status, aps2_result = post_event(aps_close_2)
     check(status == 201, f"offset-timestamp closure accepted (got {status})")
+    assert_config_block(aps2_result, "offset-timestamp closure", "APS", 20)
     new_impacts = impacts_by_flight(aps2_result)
     same = all(
         new_impacts.get(fid, {}).get("impact_status") == want_status
@@ -374,9 +427,13 @@ def seed() -> int:
         status, _ = request("GET", f"/api/v1/events/{invalid_id}")
         check(status == 404, f"rejected event '{invalid_id}' was never persisted")
 
-    print("== seed: health ==")
+    print("== seed: health and readiness ==")
     status, health = request("GET", "/healthz")
     check(status == 200 and health["status"] == "ok", "health endpoint reports ok")
+    status, ready = request("GET", "/readyz")
+    check(status == 200 and ready["status"] == "ready", "readiness endpoint reports ready")
+    check(ready["gate"]["config_digest"] == CONFIG_DIGEST,
+          "ready gate digest matches the digest used for all results")
 
     return finish("seed")
 
@@ -386,9 +443,17 @@ def seed() -> int:
 # --------------------------------------------------------------------------- #
 
 def verify() -> int:
-    print("== verify: service is healthy after restart ==")
+    print("== verify: liveness/readiness after restart, same definition ==")
     status, health = request("GET", "/healthz")
     check(status == 200 and health["status"] == "ok", "health endpoint ok after restart")
+    status, ready = request("GET", "/readyz")
+    check(status == 200 and ready["status"] == "ready",
+          f"readiness after restart (got {status})")
+    check(ready["gate"]["state"] == "aligned",
+          f"restarted instance aligns to registered facts (got {ready['gate'].get('state')})")
+    digest = ready["gate"].get("config_digest")
+    check(isinstance(digest, str) and len(digest) == 64, "gate digest present after restart")
+    globals()["CONFIG_DIGEST"] = digest
 
     print("== verify: events and impacts survived the restart ==")
     status, aps1 = request("GET", f"/api/v1/events/{APS_CLOSE}")
@@ -396,12 +461,18 @@ def verify() -> int:
           "original APS closure with 3 impacts survived")
     check(aps1["processing"]["replay_count"] == 1,
           f"replay_count=1 survived (got {aps1['processing']['replay_count']})")
+    check(aps1.get("config", {}).get("config_digest") == digest,
+          "persisted APS event references the same config digest after restart")
+    check(aps1.get("config", {}).get("airport", {}).get("reopen_buffer_minutes") == 20,
+          "persisted APS event embeds the APS definition (buffer 20)")
 
     status, aps2 = request("GET", f"/api/v1/events/{APS_CLOSE_2}")
     check(status == 200 and len(aps2["impacts"]) == 3,
           "second (offset) APS closure with 3 impacts survived")
     check(all(i["crosses_midnight"] for i in aps2["impacts"]),
           "cross-midnight flags survived")
+    check(aps2.get("config", {}).get("config_digest") == digest,
+          "second APS event uses the same config digest")
 
     status, reopened = request("GET", f"/api/v1/events/{APS_REOPEN}")
     check(status == 200 and reopened["processing"]["resolved_count"] == 3,
@@ -417,10 +488,14 @@ def verify() -> int:
         by.get("AX-410-20260907", {}).get("impact_status") == "pending_confirmation",
         "BSR open-ended pending impact (AX410) survived",
     )
+    check(bsr.get("config", {}).get("config_digest") == digest,
+          "BSR event uses the same config digest after restart")
     status, kta = request("GET", f"/api/v1/events/{KTA_CLOSE}")
     kx = impacts_by_flight(kta).get("KX-099-20260908")
     check(kx is not None and kx["impact_status"] == "delayed" and kx["delay_minutes"] == 20,
           "KTA delayed impact survived")
+    check(kta.get("config", {}).get("airport", {}).get("reopen_buffer_minutes") == 10,
+          "KTA event embeds the KTA definition (buffer 10)")
 
     _, page = request("GET", "/api/v1/flights/affected?limit=100")
     check(page["pagination"]["total"] == 6,
